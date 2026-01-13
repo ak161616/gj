@@ -8,7 +8,8 @@ RUN apk add --no-cache tini git
 WORKDIR /app
 
 # 在构建时完成所有重型工作
-RUN git clone -b staging --depth 1 https://github.com/SillyTavern/SillyTavern.git .
+# 这是一个小技巧，利用 date 命令让 Docker 每次都认为这行指令是新的
+RUN git clone -b release --depth 1 https://github.com/SillyTavern/SillyTavern.git .
 RUN npm i --no-audit --no-fund --loglevel=error --no-progress --omit=dev --force && npm cache clean --force
 RUN node docker/build-lib.js
 
