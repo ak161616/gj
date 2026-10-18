@@ -60,7 +60,7 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
             if ! git diff --cached --quiet; then
                 # 在 commit message 中加入 HF Space 名称，方便区分
                 COMMIT_MESSAGE="Cloud Backup from HF/${SPACE_ID:-unknown}: $(date)"
-                git commit -m "$COMMIT_MESSAGE" && git push -f origin HEAD:main
+                git commit -m "$COMMIT_MESSAGE" && (git push -f origin HEAD:main || echo "--- [Cloud Save] Push failed, will retry next cycle.")
             fi
         done
     ) &
