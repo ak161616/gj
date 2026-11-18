@@ -7,6 +7,10 @@ RUN apk add --no-cache tini git
 # 设置工作目录
 WORKDIR /app
 
+# 关键修复：将 Node.js 堆内存上限从默认的 2GB 提升至 8GB（8192MB）
+# 防止构建依赖或运行时导入/解析大型 V3 角色卡、世界书时触发 JavaScript heap out of memory 崩溃
+ENV NODE_OPTIONS="--max-old-space-size=8192"
+
 # 破除 GitHub Actions 缓存：以后每次想强制更新 ST，改一下这个数字或日期即可
 ARG CACHEBUST=20261018
 
