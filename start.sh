@@ -1,12 +1,12 @@
 #!/bin/sh
-# 升级版启动脚本 (V24-Lite - 容错增强，支持重启回档)
+# 升级版启动脚本 (V25 - 容错增强 + 自动仓库瘦身，支持重启回档)
 set -e
-echo "--- [Launcher V24-Lite] Starting..."
+echo "--- [Launcher V25] Starting..."
 
 # 1. 从环境变量安全写入 config.yaml
 if [ -n "$CONFIG_YAML" ]; then
     printf '%s\n' "$CONFIG_YAML" > /app/config.yaml
-    echo "--- [Launcher V24-Lite] config.yaml created from environment secret."
+    echo "--- [Launcher V25] config.yaml created from environment secret."
 else
     echo "CRITICAL: CONFIG_YAML environment variable not found! Halting."
     exit 1
@@ -18,7 +18,7 @@ LOCK_DIR="/tmp/st_backup.lock"
 NEED_PUSH_FILE="/tmp/st_need_push"
 rm -rf "$LOCK_DIR" "$NEED_PUSH_FILE"
 
-# 封装安全的云备份函数（独立关闭 set -e，防止单次文件冲突导致后台定时备份假死）
+# 封装安全的云备份函数（独立关闭 set -e，防止单次文件冲突导致后台备份假死）
 do_backup() {
     (
         set +e
@@ -40,7 +40,6 @@ do_backup() {
             fi
         fi
 
-        # 只要有新提交，或上次因网络波动没推上去，就执行推送
         if [ -f "$NEED_PUSH_FILE" ]; then
             if git push origin HEAD:main > /dev/null 2>&1 || git push -f origin HEAD:main > /dev/null 2>&1; then
                 rm -f "$NEED_PUSH_FILE"
@@ -63,7 +62,6 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
     CLEAN_REPO_URL="${CLEAN_REPO_URL#http://}"
     AUTH_REPO_URL="https://oauth2:${GITHUB_TOKEN}@${CLEAN_REPO_URL}"
 
-    # 带 3 次重试的浅克隆，只拉取最新完整快照，提速且抗网络抖动
     SYNC_OK=0
     for i in 1 2 3; do
         if [ -d "$DATA_DIR/.git" ]; then
@@ -88,9 +86,41 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
         cd "$DATA_DIR"
         git config user.name "SillyTavern Backup"
         git config user.email "backup@huggingface.space"
+
+        # 写入忽略规则：屏蔽本地套娃备份、缩略图、系统缓存和日志
+        cat << 'EOF' > "$DATA_DIR/.gitignore"
+/backups/
+/*/backups/
+/*/thumbnails/
+/_cache/
+/_webpack/
+/_uploads/
+/access.log
+/*/content.log
+EOF
+
+        # 若云端旧存档里还包含上述冗余文件，自动执行一次性瘦身并推送
+        if [ -n "$(git ls-files -i --exclude-standard | head -n 1)" ]; then
+            echo "--- [Cloud Save] Detected legacy backups/caches in repo. Slimming down..."
+            git rm -r --cached --ignore-unmatch \
+                backups _cache _webpack _uploads access.log \
+                ':(glob)*/backups' ':(glob)*/thumbnails' ':(glob)*/content.log' > /dev/null 2>&1 || true
+            git add .gitignore > /dev/null 2>&1 || true
+            if ! git diff --cached --quiet; then
+                if git commit -m "Slim down repo: ignore caches and local backups" > /dev/null 2>&1; then
+                    if git push origin HEAD:main > /dev/null 2>&1 || git push -f origin HEAD:main > /dev/null 2>&1; then
+                        echo "--- [Cloud Save] Repo slimmed down and pushed! Future restarts will be much faster."
+                    else
+                        touch "$NEED_PUSH_FILE"
+                        echo "--- [Cloud Save] Slim push delayed, will retry in next backup cycle."
+                    fi
+                fi
+            fi
+        fi
+
         cd /app
 
-        # 后台定时备份循环（关闭 set -e，确保长期稳定运行）
+        # 后台定时备份循环
         (
             set +e
             while true; do
@@ -107,5 +137,5 @@ else
     echo "--- [Cloud Save] One or more secrets missing. Cloud save is DISABLED."
 fi
 
-echo "--- [Launcher V24-Lite] All setup complete. Starting SillyTavern server..."
+echo "--- [Launcher V25] All setup complete. Starting SillyTavern server..."
 exec node server.js
