@@ -1,74 +1,111 @@
 #!/bin/sh
-# 最终版启动脚本 (V23 - Diagnostic & Fault-Tolerant)
+# 升级版启动脚本 (V24-Lite - 容错增强，支持重启回档)
 set -e
-echo "--- [Launcher V23] Starting..."
+echo "--- [Launcher V24-Lite] Starting..."
 
-# 1. 从环境变量创建 config.yaml
+# 1. 从环境变量安全写入 config.yaml
 if [ -n "$CONFIG_YAML" ]; then
-    echo "$CONFIG_YAML" > /app/config.yaml
-    echo "--- [Launcher V23] config.yaml created from environment secret."
+    printf '%s\n' "$CONFIG_YAML" > /app/config.yaml
+    echo "--- [Launcher V24-Lite] config.yaml created from environment secret."
 else
     echo "CRITICAL: CONFIG_YAML environment variable not found! Halting."
     exit 1
 fi
 
 cd /app
+DATA_DIR="/app/data"
+LOCK_DIR="/tmp/st_backup.lock"
+NEED_PUSH_FILE="/tmp/st_need_push"
+rm -rf "$LOCK_DIR" "$NEED_PUSH_FILE"
 
-# 2. 诊断并配置云存档
+# 封装安全的云备份函数（独立关闭 set -e，防止单次文件冲突导致后台定时备份假死）
+do_backup() {
+    (
+        set +e
+        if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+            echo "--- [Cloud Save] Backup already running, skipping."
+            exit 0
+        fi
+        trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+        cd "$DATA_DIR" || exit 0
+        git add -A > /dev/null 2>&1
+
+        if ! git diff --cached --quiet; then
+            COMMIT_MESSAGE="Auto Backup from HF/${SPACE_ID:-unknown}: $(date '+%Y-%m-%d %H:%M:%S')"
+            if git commit -m "$COMMIT_MESSAGE" > /dev/null 2>&1; then
+                touch "$NEED_PUSH_FILE"
+            else
+                echo "--- [Cloud Save] Commit failed, will retry next cycle."
+            fi
+        fi
+
+        # 只要有新提交，或上次因网络波动没推上去，就执行推送
+        if [ -f "$NEED_PUSH_FILE" ]; then
+            if git push origin HEAD:main > /dev/null 2>&1 || git push -f origin HEAD:main > /dev/null 2>&1; then
+                rm -f "$NEED_PUSH_FILE"
+                echo "--- [Cloud Save] Pushed successfully at $(date '+%H:%M:%S')."
+            else
+                echo "--- [Cloud Save] Push failed (network hiccup), will retry next cycle."
+            fi
+        fi
+    )
+}
+
+# 2. 诊断并初始化云存档
 echo "--- [Cloud Save] Diagnostic Checks ---"
+[ -z "$REPO_URL" ] && echo "--> REPO_URL secret: NOT FOUND." || echo "--> REPO_URL secret: Found."
+[ -z "$GITHUB_TOKEN" ] && echo "--> GITHUB_TOKEN secret: NOT FOUND." || echo "--> GITHUB_TOKEN secret: Found."
 
-# 明确检查每一个 Secret
-if [ -z "$REPO_URL" ]; then
-    echo "--> REPO_URL secret: NOT FOUND. Skipping cloud save."
-else
-    echo "--> REPO_URL secret: Found."
-fi
-
-if [ -z "$GITHUB_TOKEN" ]; then
-    echo "--> GITHUB_TOKEN secret: NOT FOUND. Skipping cloud save."
-else
-    echo "--> GITHUB_TOKEN secret: Found."
-fi
-
-# 只有在所有条件都满足时，才执行
 if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
     echo "--- [Cloud Save] All secrets found. Initializing Smart Sync..."
-    DATA_DIR="/app/data"
-    AUTH_REPO_URL="https://oauth2:${GITHUB_TOKEN}@${REPO_URL}"
-    
-    if [ -d "$DATA_DIR/.git" ]; then
-        echo "--- [Cloud Save] Existing repository found. Pulling latest changes..."
-        cd "$DATA_DIR"
-        git remote set-url origin "$AUTH_REPO_URL"
-        git fetch origin main
-        git reset --hard origin/main
-    else
-        echo "--- [Cloud Save] Directory is not a valid git repository. Forcing a clean clone..."
-        rm -rf "$DATA_DIR"
-        git clone "$AUTH_REPO_URL" "$DATA_DIR"
-    fi
-    
-    cd "$DATA_DIR"
-    git config user.name "SillyTavern Backup"
-    git config user.email "backup@huggingface.space"
-    echo "--- [Cloud Save] Git user configured locally."
+    CLEAN_REPO_URL="${REPO_URL#https://}"
+    CLEAN_REPO_URL="${CLEAN_REPO_URL#http://}"
+    AUTH_REPO_URL="https://oauth2:${GITHUB_TOKEN}@${CLEAN_REPO_URL}"
 
-    (
-        while true; do
-            sleep "$((${AUTOSAVE_INTERVAL:-30} * 60))"
-            cd "$DATA_DIR" && git add . > /dev/null
-            if ! git diff --cached --quiet; then
-                # 在 commit message 中加入 HF Space 名称，方便区分
-                COMMIT_MESSAGE="Cloud Backup from HF/${SPACE_ID:-unknown}: $(date)"
-                git commit -m "$COMMIT_MESSAGE" && (git push -f origin HEAD:main || echo "--- [Cloud Save] Push failed, will retry next cycle.")
+    # 带 3 次重试的浅克隆，只拉取最新完整快照，提速且抗网络抖动
+    SYNC_OK=0
+    for i in 1 2 3; do
+        if [ -d "$DATA_DIR/.git" ]; then
+            echo "--- [Cloud Save] Fetching latest backup (Attempt $i/3)..."
+            if (cd "$DATA_DIR" && git remote set-url origin "$AUTH_REPO_URL" && git fetch --depth 1 origin main && git reset --hard origin/main); then
+                SYNC_OK=1
+                break
             fi
-        done
-    ) &
-    echo "--- [Cloud Save] Auto-save process is now running in the background."
-    cd /app
+        else
+            echo "--- [Cloud Save] Cloning latest backup (Attempt $i/3)..."
+            rm -rf "$DATA_DIR"
+            if git clone --depth 1 "$AUTH_REPO_URL" "$DATA_DIR"; then
+                SYNC_OK=1
+                break
+            fi
+        fi
+        echo "--- [Cloud Save] Attempt $i failed, retrying in 5s..."
+        sleep 5
+    done
+
+    if [ "$SYNC_OK" -eq 1 ]; then
+        cd "$DATA_DIR"
+        git config user.name "SillyTavern Backup"
+        git config user.email "backup@huggingface.space"
+        cd /app
+
+        # 后台定时备份循环（关闭 set -e，确保长期稳定运行）
+        (
+            set +e
+            while true; do
+                sleep "$((${AUTOSAVE_INTERVAL:-30} * 60))"
+                do_backup
+            done
+        ) &
+        echo "--- [Cloud Save] Auto-save running in background (every ${AUTOSAVE_INTERVAL:-30} min)."
+    else
+        echo "CRITICAL: Cloud Save sync failed after 3 attempts! Halting to protect data."
+        exit 1
+    fi
 else
-    echo "--- [Cloud Save] One or more secrets were missing. Cloud save is DISABLED."
+    echo "--- [Cloud Save] One or more secrets missing. Cloud save is DISABLED."
 fi
 
-echo "--- [Launcher V23] All setup complete. Starting SillyTavern server..."
+echo "--- [Launcher V24-Lite] All setup complete. Starting SillyTavern server..."
 exec node server.js
