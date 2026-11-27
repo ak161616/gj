@@ -1,12 +1,12 @@
 #!/bin/sh
-# 升级版启动脚本 (V25 - 容错增强 + 自动仓库瘦身，支持重启回档)
+# 升级版启动脚本 (V26 - 免落盘极速瘦身 + 容错增强，支持重启回档)
 set -e
-echo "--- [Launcher V25] Starting..."
+echo "--- [Launcher V26] Starting..."
 
 # 1. 从环境变量安全写入 config.yaml
 if [ -n "$CONFIG_YAML" ]; then
     printf '%s\n' "$CONFIG_YAML" > /app/config.yaml
-    echo "--- [Launcher V25] config.yaml created from environment secret."
+    echo "--- [Launcher V26] config.yaml created from environment secret."
 else
     echo "CRITICAL: CONFIG_YAML environment variable not found! Halting."
     exit 1
@@ -18,7 +18,20 @@ LOCK_DIR="/tmp/st_backup.lock"
 NEED_PUSH_FILE="/tmp/st_need_push"
 rm -rf "$LOCK_DIR" "$NEED_PUSH_FILE"
 
-# 封装安全的云备份函数（独立关闭 set -e，防止单次文件冲突导致后台备份假死）
+write_gitignore() {
+cat << 'EOF' > "$DATA_DIR/.gitignore"
+/backups/
+/*/backups/
+/*/thumbnails/
+/_cache/
+/_webpack/
+/_uploads/
+/access.log
+/*/content.log
+EOF
+}
+
+# 封装安全的云备份函数
 do_backup() {
     (
         set +e
@@ -63,6 +76,7 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
     AUTH_REPO_URL="https://oauth2:${GITHUB_TOKEN}@${CLEAN_REPO_URL}"
 
     SYNC_OK=0
+    NEED_CHECKOUT=0
     for i in 1 2 3; do
         if [ -d "$DATA_DIR/.git" ]; then
             echo "--- [Cloud Save] Fetching latest backup (Attempt $i/3)..."
@@ -71,10 +85,12 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
                 break
             fi
         else
-            echo "--- [Cloud Save] Cloning latest backup (Attempt $i/3)..."
+            echo "--- [Cloud Save] Cloning backup metadata without checkout (Attempt $i/3)..."
             rm -rf "$DATA_DIR"
-            if git clone --depth 1 "$AUTH_REPO_URL" "$DATA_DIR"; then
+            # 关键优化：--no-checkout 只下载压缩包，不把 5 万多个旧文件写到硬盘
+            if git clone --depth 1 --no-checkout "$AUTH_REPO_URL" "$DATA_DIR"; then
                 SYNC_OK=1
+                NEED_CHECKOUT=1
                 break
             fi
         fi
@@ -87,35 +103,39 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
         git config user.name "SillyTavern Backup"
         git config user.email "backup@huggingface.space"
 
-        # 写入忽略规则：屏蔽本地套娃备份、缩略图、系统缓存和日志
-        cat << 'EOF' > "$DATA_DIR/.gitignore"
-/backups/
-/*/backups/
-/*/thumbnails/
-/_cache/
-/_webpack/
-/_uploads/
-/access.log
-/*/content.log
-EOF
+        # 先把文件清单读入索引（不写硬盘，约 1 秒完成）
+        if [ "$NEED_CHECKOUT" -eq 1 ]; then
+            git read-tree HEAD
+        fi
 
-        # 若云端旧存档里还包含上述冗余文件，自动执行一次性瘦身并推送
+        write_gitignore
+
+        # 直接在索引中剔除冗余缓存与本地备份，彻底避开慢速硬盘写入
         if [ -n "$(git ls-files -c -i --exclude-standard | head -n 1)" ]; then
-            echo "--- [Cloud Save] Detected legacy backups/caches in repo. Slimming down..."
-            git rm -r --cached --ignore-unmatch \
-                backups _cache _webpack _uploads access.log \
-                ':(glob)*/backups' ':(glob)*/thumbnails' ':(glob)*/content.log' > /dev/null 2>&1 || true
+            BEFORE_COUNT=$(git ls-files | wc -l)
+            echo "--- [Cloud Save] Detected legacy backups/caches ($BEFORE_COUNT files total). Slimming down in memory..."
+            git ls-files -c -i --exclude-standard -z | git update-index --force-remove -z --stdin
             git add .gitignore > /dev/null 2>&1 || true
+            AFTER_COUNT=$(git ls-files | wc -l)
+            echo "--- [Cloud Save] Index slimmed: $BEFORE_COUNT -> $AFTER_COUNT files."
             if ! git diff --cached --quiet; then
                 if git commit -m "Slim down repo: ignore caches and local backups" > /dev/null 2>&1; then
                     if git push origin HEAD:main > /dev/null 2>&1 || git push -f origin HEAD:main > /dev/null 2>&1; then
-                        echo "--- [Cloud Save] Repo slimmed down and pushed! Future restarts will be much faster."
+                        echo "--- [Cloud Save] Repo slimmed down and pushed!"
                     else
                         touch "$NEED_PUSH_FILE"
                         echo "--- [Cloud Save] Slim push delayed, will retry in next backup cycle."
                     fi
                 fi
             fi
+        fi
+
+        # 只把瘦身后的干净文件释放到硬盘
+        if [ "$NEED_CHECKOUT" -eq 1 ]; then
+            FINAL_COUNT=$(git ls-files | wc -l)
+            echo "--- [Cloud Save] Checking out $FINAL_COUNT clean files..."
+            git checkout -f HEAD -- .
+            write_gitignore
         fi
 
         cd /app
@@ -137,5 +157,5 @@ else
     echo "--- [Cloud Save] One or more secrets missing. Cloud save is DISABLED."
 fi
 
-echo "--- [Launcher V25] All setup complete. Starting SillyTavern server..."
+echo "--- [Launcher V26] All setup complete. Starting SillyTavern server..."
 exec node server.js
