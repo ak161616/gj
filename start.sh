@@ -100,7 +100,7 @@ if [ -n "$REPO_URL" ] && [ -n "$GITHUB_TOKEN" ]; then
 EOF
 
         # 若云端旧存档里还包含上述冗余文件，自动执行一次性瘦身并推送
-        if [ -n "$(git ls-files -i --exclude-standard | head -n 1)" ]; then
+        if [ -n "$(git ls-files -c -i --exclude-standard | head -n 1)" ]; then
             echo "--- [Cloud Save] Detected legacy backups/caches in repo. Slimming down..."
             git rm -r --cached --ignore-unmatch \
                 backups _cache _webpack _uploads access.log \
